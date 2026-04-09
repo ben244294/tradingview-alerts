@@ -19,7 +19,7 @@ TELEGRAM_TOKEN   = "8282705170:AAHM0iAJ50WESe79IZMUyxXAg5aUc9q7Gno"
 TELEGRAM_CHAT_ID = "7936995648"
 TELEGRAM_URL     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-WEBHOOK_SECRET   = "gallop123"   # ← Change this to any password you like
+WEBHOOK_SECRET   = "Thepasswordis@2"   # ← Change this to any password you like
 # ─────────────────────────────────────────────
 
 app = Flask(__name__)
