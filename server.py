@@ -101,16 +101,16 @@ def test():
 @app.route("/", methods=["GET"])
 def home():
     return "TradingView Alert Server is running ✅", 200
-
-
+    
 if __name__ == "__main__":
     print("=" * 50)
     print("  TradingView Alert Server (Telegram Edition)")
     print("=" * 50)
     print(f"  Telegram Chat ID : {TELEGRAM_CHAT_ID}")
-    print(f"  Webhook URL      : http://localhost:5000/webhook?secret={WEBHOOK_SECRET}")
+    print(f"  Webhook URL      : /webhook?secret={WEBHOOK_SECRET}")
+    print("=" * 50)
     import os
-port = int(os.environ.get("PORT", 5000))
-app.run(host="0.0.0.0", port=port, debug=False)
-print("=" * 50)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
+
