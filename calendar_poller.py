@@ -5,7 +5,9 @@ Economic Calendar Poller
 - Sends actual data release after the event fires
 - Compares actual vs forecast and gives a reaction signal
 - Daily 7am briefing
-- Deployed to Railway as a background worker
+- Keep-alive ping every 10 mins to prevent Render free tier sleep
+
+Deployed on Render as a Background Worker.
 """
 
 import requests
@@ -22,6 +24,9 @@ TELEGRAM_TOKEN   = "8282705170:AAHM0iAJ50WESe79IZMUyxXAg5aUc9q7Gno"
 TELEGRAM_CHAT_ID = "7936995648"
 TELEGRAM_URL     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
+# Your Render web service URL — keeps server.py awake
+RENDER_URL       = "https://tradingview-alerts-gbov.onrender.com"
+
 UTC_OFFSET_HOURS    = 0
 TIMEZONE_LABEL      = "Accra (UTC+0)"
 WARN_MINUTES_BEFORE = 30
@@ -32,6 +37,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 PAIR_CURRENCIES = {
     "GBPUSD":    ["GBP", "USD"],
     "GBPJPY":    ["GBP", "JPY"],
+    "XAUUSD":    ["USD"],
+    "XAGUSD":    ["USD"],
     "US Oil":    ["USD"],
     "NAS100":    ["USD"],
     "German 40": ["EUR"],
@@ -72,10 +79,7 @@ def format_value(value: str, label: str) -> str:
 
 
 def get_reaction_signal(actual: str, forecast: str, previous: str, currency: str) -> str:
-    """
-    Compare actual vs forecast to generate a directional reaction signal.
-    Higher than forecast = bullish for that currency in most cases.
-    """
+    """Compare actual vs forecast to generate a directional reaction signal"""
     if not actual or actual.strip() == "":
         return ""
 
@@ -95,7 +99,6 @@ def get_reaction_signal(actual: str, forecast: str, previous: str, currency: str
                 return f"📉 <b>MISSES FORECAST</b> by {abs(diff):.2f} → Bearish {currency}"
             else:
                 return f"➡️ <b>IN LINE</b> with forecast → Neutral {currency}"
-
         elif previous_f is not None:
             if actual_f > previous_f:
                 return f"📈 <b>HIGHER</b> than previous → Bullish {currency}"
@@ -103,10 +106,8 @@ def get_reaction_signal(actual: str, forecast: str, previous: str, currency: str
                 return f"📉 <b>LOWER</b> than previous → Bearish {currency}"
             else:
                 return f"➡️ <b>SAME</b> as previous → Neutral {currency}"
-
     except Exception:
         pass
-
     return ""
 
 
@@ -121,6 +122,18 @@ def send_telegram(message: str):
         logging.info("Telegram message sent")
     except Exception as e:
         logging.error(f"Telegram error: {e}")
+
+
+def keep_render_awake():
+    """
+    Ping the Render web server every 10 minutes so it never
+    sleeps on the free tier. Prevents 50s cold start delays.
+    """
+    try:
+        response = requests.get(f"{RENDER_URL}/", timeout=10)
+        logging.info(f"Keep-alive ping → status {response.status_code}")
+    except Exception as e:
+        logging.warning(f"Keep-alive ping failed: {e}")
 
 
 def get_pairs_for_currency(currency: str) -> list:
@@ -218,8 +231,7 @@ def check_upcoming_events():
 def check_actual_releases():
     """
     Poll calendar every 5 mins after event time.
-    As soon as 'actual' value appears in the feed, send it
-    with a reaction signal comparing actual vs forecast.
+    Sends actual value + reaction signal as soon as it appears.
     """
     if not pending_actuals:
         return
@@ -235,7 +247,6 @@ def check_actual_releases():
     for event_id, queued in list(pending_actuals.items()):
         event_time = queued["event_time"]
 
-        # Only check events that have already passed
         if now < event_time:
             continue
 
@@ -354,11 +365,12 @@ def send_daily_preview():
 
 def run_scheduler():
     print("=" * 50)
-    print("  Economic Calendar Poller (with Actuals)")
+    print("  Economic Calendar Poller (Render Edition)")
     print("=" * 50)
     print(f"  Timezone  : {TIMEZONE_LABEL}")
     print(f"  Warning   : {WARN_MINUTES_BEFORE} mins before event")
     print(f"  Actuals   : polled every 5 mins after release")
+    print(f"  Keep-alive: every 10 mins → {RENDER_URL}")
     print("=" * 50)
 
     # Check for upcoming warnings every 5 mins
@@ -367,12 +379,16 @@ def run_scheduler():
     # Check for actual data releases every 5 mins
     schedule.every(5).minutes.do(check_actual_releases)
 
+    # Keep Render web server awake every 10 mins
+    schedule.every(10).minutes.do(keep_render_awake)
+
     # Daily 7am briefing
     schedule.every().day.at("07:00").do(send_daily_preview)
 
     # Run immediately on startup
     check_upcoming_events()
     send_daily_preview()
+    keep_render_awake()
 
     while True:
         schedule.run_pending()
