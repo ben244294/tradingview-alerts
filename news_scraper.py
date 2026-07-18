@@ -5,15 +5,17 @@ Scrapes financial news from multiple sources at optimal market times,
 scores headlines with sentiment analysis, filters accurately per pair,
 calculates impact probability and duration, then sends to Telegram.
 
+Keep-alive ping every 10 mins to prevent Render free tier sleep.
+
 Pairs: GBPUSD, GBPJPY, XAUUSD, XAGUSD, BTCUSD, ETHUSD,
        US Oil, NAS100, German 40
 
 Optimal scan times (UTC):
-  06:00 — Pre-London open (Asian session closing)
+  06:00 — Pre-London open
   08:00 — London open (highest FX volatility)
-  12:00 — London/NY overlap (highest volume globally)
-  15:00 — NY afternoon (US data & Fed speakers)
-  19:00 — NY close / crypto evening session
+  12:00 — London/NY overlap (highest volume)
+  15:00 — NY afternoon (US data window)
+  19:00 — NY close / crypto evening
   22:00 — Asian open + crypto overnight
 """
 
@@ -32,18 +34,18 @@ TELEGRAM_TOKEN    = "8282705170:AAHM0iAJ50WESe79IZMUyxXAg5aUc9q7Gno"
 TELEGRAM_CHAT_ID  = "7936995648"
 TELEGRAM_URL      = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-MIN_IMPACT_THRESHOLD     = 50   # raised from 40 → filters more aggressively
-MAX_HEADLINES_PER_REPORT = 6    # quality over quantity
-MIN_HEADLINE_LENGTH      = 30   # ignore very short/vague headlines
+# Your Render web service URL — keeps server.py awake
+RENDER_URL        = "https://tradingview-alerts-gbov.onrender.com"
+
+MIN_IMPACT_THRESHOLD     = 50
+MAX_HEADLINES_PER_REPORT = 6
+MIN_HEADLINE_LENGTH      = 30
 # ─────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ─────────────────────────────────────────────
-# PAIR KEYWORDS
-# Each pair has PRIMARY (high weight) and
-# SECONDARY (lower weight) keyword groups
-# for more accurate filtering
+# PAIR KEYWORDS — primary, secondary, exclude
 # ─────────────────────────────────────────────
 PAIR_CONFIG = {
     "GBPUSD": {
@@ -182,35 +184,26 @@ DURATION_RULES = [
     (["interest rate decision", "rate decision", "fomc statement",
       "boe rate", "boj rate", "ecb rate", "central bank"],
      "1–3 days", 48),
-
     (["geopolitical", "war", "conflict", "sanction", "crisis",
       "emergency meeting", "military"],
      "days to weeks", 120),
-
     (["opec cut", "opec production", "opec meeting", "iran sanction",
       "russia oil", "saudi arabia output"],
      "1–2 days", 36),
-
     (["bitcoin etf", "ethereum etf", "sec bitcoin", "sec ethereum",
       "crypto regulation", "bitcoin halving"],
      "1–3 days", 48),
-
     (["nonfarm", "non-farm payroll", "gdp", "unemployment rate"],
      "4–8 hours", 6),
-
     (["cpi", "inflation", "ppi", "core inflation"],
      "4–8 hours", 6),
-
     (["earnings", "quarterly profit", "revenue beat", "revenue miss"],
      "1–2 days", 36),
-
     (["pmi", "retail sales", "consumer confidence", "trade balance"],
      "2–4 hours", 3),
-
     (["powell", "lagarde", "bailey", "ueda", "speech", "testimony",
       "press conference", "statement"],
      "2–6 hours", 4),
-
     (["bitcoin price", "ethereum price", "crypto market",
       "btc", "eth rally", "crypto sell"],
      "1–4 hours", 2),
@@ -218,17 +211,12 @@ DURATION_RULES = [
 
 DEFAULT_DURATION = ("1–3 hours", 2)
 
-# ─────────────────────────────────────────────
-# NOISE FILTER — headlines containing these
-# are skipped entirely regardless of keywords
-# ─────────────────────────────────────────────
 NOISE_PHRASES = [
     "sponsored", "advertisement", "subscribe now", "click here",
     "sign up", "free trial", "webinar", "podcast episode",
     "weekly roundup", "morning briefing", "evening wrap",
     "this week in", "last week in", "monthly review",
-    "technical analysis for beginners", "how to trade",
-    "quiz", "crossword", "opinion:", "editorial:"
+    "how to trade", "quiz", "opinion:", "editorial:"
 ]
 
 BULLISH_WORDS = [
@@ -268,28 +256,28 @@ sent_headlines = set()
 
 
 # ─────────────────────────────────────────────
-# FILTERING
+# CORE FUNCTIONS
 # ─────────────────────────────────────────────
 
+def keep_render_awake():
+    """Ping Render server every 10 mins to prevent free tier sleep"""
+    try:
+        response = requests.get(f"{RENDER_URL}/", timeout=10)
+        logging.info(f"Keep-alive ping → status {response.status_code}")
+    except Exception as e:
+        logging.warning(f"Keep-alive ping failed: {e}")
+
+
 def is_noise(headline: str) -> bool:
-    """Return True if headline is irrelevant noise"""
     text = headline.lower()
     return any(phrase in text for phrase in NOISE_PHRASES)
 
 
 def get_pair_relevance_score(headline: str, pair: str) -> float:
-    """
-    More accurate relevance scoring using primary/secondary keywords.
-    Primary keyword match = 1.0 weight
-    Secondary keyword match = 0.4 weight
-    Exclude keyword match = disqualifies entirely
-    Returns 0.0–1.0
-    """
-    config    = PAIR_CONFIG.get(pair, {})
-    text      = headline.lower()
+    config  = PAIR_CONFIG.get(pair, {})
+    text    = headline.lower()
 
-    # Check exclusion list first
-    excludes  = config.get("exclude", [])
+    excludes = config.get("exclude", [])
     if any(ex in text for ex in excludes):
         return 0.0
 
@@ -302,21 +290,15 @@ def get_pair_relevance_score(headline: str, pair: str) -> float:
     if primary_matches == 0 and secondary_matches == 0:
         return 0.0
 
-    # Primary match alone is strong enough
     if primary_matches > 0:
         score = min((primary_matches * 1.0 + secondary_matches * 0.4) / 2.0, 1.0)
     else:
-        # Secondary only — lower score
         score = min(secondary_matches * 0.4 / 2.0, 0.5)
 
     return round(score, 2)
 
 
 def get_affected_pairs(headline: str) -> dict:
-    """
-    Returns {pair: relevance_score} for all relevant pairs.
-    Only includes pairs with relevance > 0.
-    """
     return {
         pair: score
         for pair in PAIR_CONFIG
@@ -325,17 +307,6 @@ def get_affected_pairs(headline: str) -> dict:
 
 
 def score_sentiment(headline: str) -> tuple:
-    """
-    Keyword-based sentiment scorer.
-    Returns (label, confidence): BULLISH / BEARISH / NEUTRAL
-
-    TODO: Replace with FinBERT after Hugging Face course:
-    from transformers import pipeline
-    finbert = pipeline("text-classification", model="yiyanghkust/finbert-tone")
-    result = finbert(headline)[0]
-    label_map = {"Positive":"BULLISH","Negative":"BEARISH","Neutral":"NEUTRAL"}
-    return label_map[result["label"]], round(result["score"], 2)
-    """
     text    = headline.lower()
     bullish = sum(1 for w in BULLISH_WORDS if w in text)
     bearish = sum(1 for w in BEARISH_WORDS if w in text)
@@ -351,10 +322,6 @@ def score_sentiment(headline: str) -> tuple:
 
 
 def calculate_impact_probability(headline: str, relevance_score: float, confidence: float) -> int:
-    """
-    Calculate impact probability using relevance score + sentiment
-    confidence + high-impact trigger words.
-    """
     text    = headline.lower()
     trigger = min(sum(0.1 for t in HIGH_IMPACT_TRIGGERS if t in text), 0.35)
     raw     = (relevance_score * 0.5) + (confidence * 0.25) + trigger
@@ -362,7 +329,6 @@ def calculate_impact_probability(headline: str, relevance_score: float, confiden
 
 
 def get_impact_duration(headline: str) -> tuple:
-    """Estimate how long this headline will affect the market"""
     text = headline.lower()
     for triggers, label, hours in DURATION_RULES:
         if any(t in text for t in triggers):
@@ -382,10 +348,6 @@ def get_duration_emoji(hours: int) -> str:
     return "⏳" if hours >= 48 else "🕐" if hours >= 6 else "⚡"
 
 
-# ─────────────────────────────────────────────
-# RSS SCRAPERS
-# ─────────────────────────────────────────────
-
 def fetch_rss(url: str, source: str) -> list:
     headlines = []
     try:
@@ -403,10 +365,6 @@ def fetch_rss(url: str, source: str) -> list:
     return headlines
 
 
-# ─────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────
-
 def send_telegram(message: str):
     for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
         try:
@@ -418,10 +376,6 @@ def send_telegram(message: str):
         except Exception as e:
             logging.error(f"Telegram error: {e}")
 
-
-# ─────────────────────────────────────────────
-# MAIN SCAN
-# ─────────────────────────────────────────────
 
 def run_market_scan(session_label: str = ""):
     logging.info(f"Starting market scan — {session_label}")
@@ -442,23 +396,18 @@ def run_market_scan(session_label: str = ""):
         headline = item["text"]
         source   = item["source"]
 
-        # Skip duplicates
         if headline in sent_headlines:
             continue
-
-        # Skip noise
         if is_noise(headline):
             continue
 
-        # Get affected pairs with relevance scores
         pair_relevance = get_affected_pairs(headline)
         if not pair_relevance:
             continue
 
-        label, confidence        = score_sentiment(headline)
-        duration_label, dur_hrs  = get_impact_duration(headline)
+        label, confidence       = score_sentiment(headline)
+        duration_label, dur_hrs = get_impact_duration(headline)
 
-        # Calculate impact probability per pair using relevance score
         pair_impacts = {
             pair: calculate_impact_probability(headline, rel_score, confidence)
             for pair, rel_score in pair_relevance.items()
@@ -484,8 +433,8 @@ def run_market_scan(session_label: str = ""):
     top = scored[:MAX_HEADLINES_PER_REPORT]
 
     if not top:
-        logging.info("No relevant headlines this scan")
-        return  # Silent — no telegram if nothing relevant
+        logging.info("No relevant headlines this scan — skipping Telegram")
+        return
 
     now   = datetime.now(timezone.utc).strftime("%H:%M UTC")
     label = f" — {session_label}" if session_label else ""
@@ -521,30 +470,19 @@ def run_market_scan(session_label: str = ""):
     logging.info(f"Sent {len(top)} headlines")
 
 
-# ─────────────────────────────────────────────
-# SCHEDULER — optimal market session times UTC
-# ─────────────────────────────────────────────
-
 def run_scheduler():
     print("=" * 60)
-    print("  Market Intelligence Scraper")
+    print("  Market Intelligence Scraper (Render Edition)")
     print("=" * 60)
     print("  Pairs   : GBPUSD, GBPJPY, XAUUSD, XAGUSD,")
     print("            BTCUSD, ETHUSD, US Oil, NAS100, GER40")
     print("  Sources : ForexLive, FXStreet, Investing.com,")
     print("            OilPrice, Reuters, CoinTelegraph, Decrypt")
-    print("  Scans   : 6 times daily at optimal session times")
-    print("=" * 60)
-    print("  Scan schedule (UTC):")
-    print("  06:00 — Pre-London (Asian close)")
-    print("  08:00 — London open ⭐ highest FX volatility")
-    print("  12:00 — London/NY overlap ⭐ highest volume")
-    print("  15:00 — NY afternoon (US data window)")
-    print("  19:00 — NY close / crypto evening")
-    print("  22:00 — Asian open + crypto overnight")
+    print("  Scans   : 6x daily at optimal session times (UTC)")
+    print(f"  Keep-alive → {RENDER_URL}")
     print("=" * 60)
 
-    # Schedule at optimal market session times (UTC)
+    # Optimal market session scans
     schedule.every().day.at("06:00").do(run_market_scan, session_label="Pre-London")
     schedule.every().day.at("08:00").do(run_market_scan, session_label="London Open")
     schedule.every().day.at("12:00").do(run_market_scan, session_label="London/NY Overlap")
@@ -552,8 +490,12 @@ def run_scheduler():
     schedule.every().day.at("19:00").do(run_market_scan, session_label="NY Close")
     schedule.every().day.at("22:00").do(run_market_scan, session_label="Asian Open")
 
-    # Run immediately on startup
+    # Keep Render server awake every 10 mins
+    schedule.every(10).minutes.do(keep_render_awake)
+
+    # Run scan immediately on startup
     run_market_scan(session_label="Startup")
+    keep_render_awake()
 
     while True:
         schedule.run_pending()
